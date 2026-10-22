@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+temp_*.db
+forensic_report_*
+*.log
+.DS_Store
+
+venv/
+venv-linux/
+*.pyc
