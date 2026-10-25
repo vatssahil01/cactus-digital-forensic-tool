@@ -1,0 +1,81 @@
+
+name: Build Cactus for All OS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: Cactus-Windows
+          - os: ubuntu-24.04
+            artifact: Cactus-Linux
+          - os: macos-15
+            artifact: Cactus-macOS
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller reportlab numpy pillow
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Build Windows executable
+        if: runner.os == 'Windows'
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed --onedir --name Cactus python_fixed.py
+
+      - name: Build Linux application
+        if: runner.os == 'Linux'
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed --onedir --name Cactus python_fixed.py
+          tar -czf Cactus-Linux.tar.gz -C dist Cactus
+
+      - name: Build macOS application
+        if: runner.os == 'macOS'
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed --onedir --name Cactus python_fixed.py
+          ditto -c -k --sequesterRsrc --keepParent dist/Cactus.app Cactus-macOS.zip
+
+      - name: Upload Windows build
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/Cactus/
+
+      - name: Upload Linux build
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: Cactus-Linux.tar.gz
+
+      - name: Upload macOS build
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: Cactus-macOS.zip

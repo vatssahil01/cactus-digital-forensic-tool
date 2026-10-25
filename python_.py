@@ -523,7 +523,7 @@ class DigitalForensicTool:
     def show_welcome(self):
         info = (
             "╔══════════════════════════════════════════════════════════╗\n"
-            "║      DIGITAL FORENSIC INVESTIGATION TOOL  v3.0          ║\n"
+            "║              Cactus v2.0                                 ║\n"
             "╚══════════════════════════════════════════════════════════╝\n\n"
             f"  Operating System : {self.current_os}\n"
             f"  Platform         : {platform.platform()}\n"
