@@ -17,7 +17,7 @@ jobs:
             artifact: Cactus-Windows
           - os: ubuntu-24.04
             artifact: Cactus-Linux
-          - os: macos-15
+          - os: macos-15-intel
             artifact: Cactus-macOS
 
     runs-on: ${{ matrix.os }}
