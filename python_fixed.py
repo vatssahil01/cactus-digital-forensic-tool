@@ -2251,9 +2251,9 @@ class DigitalForensicTool:
                     )
 
 
-    # --------------------------------------------------------
+    # --------------------------------------------------
     # BROWSER HISTORY
-    # --------------------------------------------------------
+    # ---------------------------------------------
     def collect_browser_history(self):
         self.run_async(self._task_collect_browser_history,
                        on_done=self._on_browser_history_done,
