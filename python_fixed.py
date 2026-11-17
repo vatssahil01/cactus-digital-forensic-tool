@@ -1885,46 +1885,371 @@ class DigitalForensicTool:
     # --------------------------------------------------------
     # TIMELINE
     # --------------------------------------------------------
+    
+    # --------------------------------------------------------
+    # TIMELINE - FULL FILESYSTEM METADATA COLLECTION
+    # Windows / Linux / macOS
+    # --------------------------------------------------------
+
     def collect_timeline(self):
-        self.run_async(self._task_collect_timeline,
-                       on_done=self._on_timeline_done,
-                       status="Collecting timeline...")
+        self.run_async(
+            self._task_collect_timeline,
+            on_done=self._on_timeline_done,
+            status="Scanning all accessible drives and filesystems..."
+        )
+
+    def _timeline_roots(self):
+        """Return accessible filesystem roots for the current OS."""
+        roots = []
+
+        if self.current_os == "Windows":
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            mask = kernel32.GetLogicalDrives()
+
+            for i in range(26):
+                if mask & (1 << i):
+                    drive = f"{chr(65 + i)}:\\"
+                    drive_type = kernel32.GetDriveTypeW(drive)
+
+                    # Fixed, removable and network drives.
+                    if drive_type in (2, 3, 4) and os.path.exists(drive):
+                        roots.append(drive)
+
+        elif self.current_os == "Linux":
+            excluded_fs = {
+                "proc", "sysfs", "devtmpfs", "devpts",
+                "cgroup", "cgroup2", "tmpfs", "securityfs",
+                "debugfs", "tracefs", "pstore", "mqueue",
+                "fusectl", "configfs", "autofs"
+            }
+
+            try:
+                with open("/proc/self/mountinfo", "r",
+                          encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        parts = line.split()
+                        if "-" not in parts:
+                            continue
+
+                        sep = parts.index("-")
+                        if sep + 1 >= len(parts):
+                            continue
+
+                        fs_type = parts[sep + 1]
+                        mountpoint = parts[4]
+
+                        # Decode escaped spaces and special characters.
+                        mountpoint = re.sub(
+                            r"\\([0-7]{3})",
+                            lambda m: chr(int(m.group(1), 8)),
+                            mountpoint
+                        )
+
+                        if fs_type not in excluded_fs:
+                            if os.path.isdir(mountpoint):
+                                roots.append(mountpoint)
+
+            except OSError:
+                roots.append("/")
+
+        elif self.current_os == "Darwin":
+            roots.append("/")
+
+            # Include mounted external and additional volumes.
+            try:
+                result = subprocess.run(
+                    ["mount"],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    errors="replace"
+                )
+
+                for line in result.stdout.splitlines():
+                    match = re.search(r" on (.+?) \(([^,]+)", line)
+                    if not match:
+                        continue
+
+                    mountpoint = match.group(1)
+                    fs_type = match.group(2)
+
+                    if fs_type != "devfs" and os.path.isdir(mountpoint):
+                        roots.append(mountpoint)
+
+            except Exception:
+                pass
+
+        # Normalize and remove duplicate roots.
+        unique = []
+        seen = set()
+
+        for root in roots:
+            try:
+                normalized = os.path.realpath(root)
+                if normalized not in seen and os.path.isdir(normalized):
+                    seen.add(normalized)
+                    unique.append(normalized)
+            except OSError:
+                continue
+
+        return unique
 
     def _task_collect_timeline(self):
-        out = "=" * 60 + "\n"
-        out += "SYSTEM TIMELINE\n"
-        out += f"Collected: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        out += "=" * 60 + "\n\n"
-        out += "Recently Modified Files:\n" + "-" * 40 + "\n"
+        """Recursively collect filesystem metadata without opening file contents."""
 
-        home = str(self._home())
-        if self.current_os == "Windows":
-            paths = [os.path.join(home, "Documents"),
-                     os.path.join(home, "Downloads"),
-                     os.path.join(home, "Desktop")]
-        else:
-            paths = [os.path.join(home, "Documents"),
-                     os.path.join(home, "Downloads"),
-                     os.path.join(home, "Desktop")]
+        started = time.time()
+        collected_at = datetime.now().astimezone().isoformat()
 
-        for path in paths:
-            if os.path.exists(path):
-                out += f"\nDirectory: {path}\n"
+        result = {
+            "collected": collected_at,
+            "operating_system": self.current_os,
+            "roots": [],
+            "records": [],
+            "errors": [],
+            "files": 0,
+            "directories": 0,
+            "skipped": 0
+        }
+
+        roots = self._timeline_roots()
+        result["roots"] = roots
+
+        def report_error(path, exc):
+            result["skipped"] += 1
+            if len(result["errors"]) < 10000:
+                result["errors"].append({
+                    "path": str(path),
+                    "error": f"{type(exc).__name__}: {exc}"
+                })
+
+        def timestamp(value):
+            if value is None:
+                return ""
+
+            try:
+                return datetime.fromtimestamp(
+                    value, timezone.utc
+                ).isoformat()
+            except (ValueError, OSError, OverflowError):
+                return ""
+
+        for root in roots:
+            try:
+                root_device = os.stat(root).st_dev
+            except OSError as exc:
+                report_error(root, exc)
+                continue
+
+            # Do not follow symlinks or cross into another mounted
+            # filesystem. Each mounted filesystem is scanned separately.
+            def walk_error(exc):
+                report_error(getattr(exc, "filename", root), exc)
+
+            for current, dirs, files in os.walk(
+                root,
+                topdown=True,
+                followlinks=False,
+                onerror=walk_error
+            ):
+                # Prune symbolic links, junctions and mount boundaries.
+                safe_dirs = []
+
+                for name in dirs:
+                    path = os.path.join(current, name)
+
+                    try:
+                        if os.path.islink(path):
+                            result["skipped"] += 1
+                            continue
+
+                        if hasattr(os.path, "isjunction"):
+                            if os.path.isjunction(path):
+                                result["skipped"] += 1
+                                continue
+
+                        st = os.stat(path, follow_symlinks=False)
+
+                        if st.st_dev != root_device:
+                            continue
+
+                        safe_dirs.append(name)
+
+                        result["records"].append({
+                            "path": path,
+                            "type": "directory",
+                            "size_bytes": st.st_size,
+                            "created_utc": timestamp(
+                                getattr(st, "st_birthtime", None)
+                            ),
+                            "modified_utc": timestamp(st.st_mtime),
+                            "accessed_utc": timestamp(st.st_atime),
+                            "metadata_changed_utc": (
+                                timestamp(st.st_ctime)
+                                if os.name != "nt" else ""
+                            )
+                        })
+
+                        result["directories"] += 1
+
+                    except OSError as exc:
+                        report_error(path, exc)
+
+                dirs[:] = safe_dirs
+
+                for name in files:
+                    path = os.path.join(current, name)
+
+                    try:
+                        if os.path.islink(path):
+                            result["skipped"] += 1
+                            continue
+
+                        st = os.stat(path, follow_symlinks=False)
+
+                        if st.st_dev != root_device:
+                            continue
+
+                        if not os.path.isfile(path):
+                            result["skipped"] += 1
+                            continue
+
+                        # Windows st_ctime represents creation time.
+                        # On Linux, st_ctime is metadata-change time.
+                        created = getattr(st, "st_birthtime", None)
+
+                        if created is None and os.name == "nt":
+                            created = st.st_ctime
+
+                        result["records"].append({
+                            "path": path,
+                            "type": os.path.splitext(name)[1].lower()
+                                    or "no extension",
+                            "size_bytes": st.st_size,
+                            "created_utc": timestamp(created),
+                            "modified_utc": timestamp(st.st_mtime),
+                            "accessed_utc": timestamp(st.st_atime),
+                            "metadata_changed_utc": (
+                                timestamp(st.st_ctime)
+                                if os.name != "nt" else ""
+                            )
+                        })
+
+                        result["files"] += 1
+
+                    except OSError as exc:
+                        report_error(path, exc)
+
+        # Sort by modification timestamp, oldest first.
+        result["records"].sort(
+            key=lambda item: item["modified_utc"]
+        )
+
+        result["duration_seconds"] = round(time.time() - started, 2)
+
+        return result
+
+    def _on_timeline_done(self, result):
+        """Display summary and offer a complete CSV export."""
+
+        if not isinstance(result, dict):
+            self.timeline_text.insert(
+                "end", str(result) + "\n"
+            )
+            self.timeline_text.see("end")
+            self.investigation_data["timeline"] = str(result)
+            return
+
+        records = result["records"]
+
+        summary = (
+            "=" * 70 + "\n"
+            "FULL FILESYSTEM TIMELINE\n"
+            + "=" * 70 + "\n"
+            f"Operating system: {result['operating_system']}\n"
+            f"Collection time: {result['collected']}\n"
+            f"Scanned roots: {len(result['roots'])}\n"
+            f"Files collected: {result['files']:,}\n"
+            f"Directories collected: {result['directories']:,}\n"
+            f"Skipped / inaccessible: {result['skipped']:,}\n"
+            f"Collection duration: {result['duration_seconds']} seconds\n"
+            f"Total records: {len(records):,}\n\n"
+            "Scanned roots:\n"
+            + "\n".join(f"  {p}" for p in result["roots"])
+            + "\n\n"
+            "The complete metadata is available in the CSV export.\n"
+            + "=" * 70 + "\n"
+        )
+
+        self.timeline_text.delete("1.0", "end")
+        self.timeline_text.insert("end", summary)
+        self.timeline_text.see("end")
+
+        self.investigation_data["timeline"] = summary
+        self.investigation_data["timeline_data"] = records
+
+        self._audit(
+            "Full filesystem timeline",
+            "completed",
+            f"{len(records)} records; {result['skipped']} skipped"
+        )
+
+        if not records:
+            messagebox.showwarning(
+                "Timeline",
+                "No filesystem records were collected. "
+                "Check permissions and the collection roots."
+            )
+            return
+
+        if messagebox.askyesno(
+            "Timeline export",
+            f"Collected {len(records):,} filesystem records.\n\n"
+            "Export the complete timeline to CSV?"
+        ):
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv")],
+                initialfile=(
+                    "Cactus_Full_Timeline_"
+                    + datetime.now().strftime("%Y%m%d_%H%M%S")
+                    + ".csv"
+                )
+            )
+
+            if filename:
+                fields = [
+                    "path", "type", "size_bytes",
+                    "created_utc", "modified_utc",
+                    "accessed_utc", "metadata_changed_utc"
+                ]
+
                 try:
-                    files = os.listdir(path)[:10]
-                    for f in files:
-                        fp = os.path.join(path, f)
-                        if os.path.isfile(fp):
-                            mtime = datetime.fromtimestamp(os.path.getmtime(fp))
-                            out += f"  {f}  →  {mtime.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                except Exception:
-                    pass
-        return out
+                    with open(
+                        filename, "w", newline="",
+                        encoding="utf-8-sig"
+                    ) as f:
+                        writer = csv.DictWriter(
+                            f, fieldnames=fields,
+                            extrasaction="ignore"
+                        )
+                        writer.writeheader()
+                        writer.writerows(records)
 
-    def _on_timeline_done(self, text):
-        self.timeline_text.insert('end', text)
-        self.timeline_text.see('end')
-        self.investigation_data['timeline'] = text
+                    self._seal_report(filename)
+
+                    messagebox.showinfo(
+                        "Timeline exported",
+                        f"Complete timeline saved to:\n{filename}"
+                    )
+
+                except OSError as exc:
+                    messagebox.showerror(
+                        "Export failed",
+                        str(exc)
+                    )
+
 
     # --------------------------------------------------------
     # BROWSER HISTORY
